@@ -435,11 +435,11 @@ func (r *routerClient) SendPayment(ctx context.Context,
 		request.PaymentHash = &hash
 	}
 
+	rpcReq.Amt = int64(request.Amount)
 	// Only if there is no payment request set, we will parse the individual
 	// payment parameters.
 	if request.Invoice == "" {
 		rpcReq.Dest = request.Target[:]
-		rpcReq.Amt = int64(request.Amount)
 		rpcReq.PaymentHash = request.PaymentHash[:]
 		rpcReq.FinalCltvDelta = int32(request.FinalCLTVDelta)
 
