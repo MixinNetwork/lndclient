@@ -66,6 +66,8 @@ func WithUnspentUnconfirmedOnly() ListUnspentOption {
 
 // WalletKitClient exposes wallet functionality.
 type WalletKitClient interface {
+	ServiceClient[walletrpc.WalletKitClient]
+
 	// ListUnspent returns a list of all utxos spendable by the wallet with
 	// a number of confirmations between the specified minimum and maximum.
 	ListUnspent(ctx context.Context, minConfs, maxConfs int32,
@@ -109,6 +111,10 @@ type WalletKitClient interface {
 	EstimateFeeRate(ctx context.Context,
 		confTarget int32) (chainfee.SatPerKWeight, error)
 
+	// MinRelayFee returns the current minimum relay fee based on our chain
+	// backend in sat/kw.
+	MinRelayFee(ctx context.Context) (chainfee.SatPerKWeight, error)
+
 	// ListSweeps returns a list of sweep transaction ids known to our node.
 	// Note that this function only looks up transaction ids, and does not
 	// query our wallet for the full set of transactions. If startHeight is
@@ -128,7 +134,8 @@ type WalletKitClient interface {
 	// child-pays-for-parent (CPFP) scenario. If the given output has been
 	// used in a previous BumpFee call, then a transaction replacing the
 	// previous is broadcast, resulting in a replace-by-fee (RBF) scenario.
-	BumpFee(context.Context, wire.OutPoint, chainfee.SatPerKWeight) error
+	BumpFee(context.Context, wire.OutPoint, chainfee.SatPerKWeight,
+		...BumpFeeOption) error
 
 	// ListAccounts retrieves all accounts belonging to the wallet by default.
 	// Optional name and addressType can be provided to filter through all the
@@ -214,7 +221,7 @@ type walletKitClient struct {
 	params       *chaincfg.Params
 }
 
-// A compile-time constraint to ensure walletKitclient satisfies the
+// A compile time check to ensure that  walletKitClient implements the
 // WalletKitClient interface.
 var _ WalletKitClient = (*walletKitClient)(nil)
 
@@ -228,6 +235,15 @@ func newWalletKitClient(conn grpc.ClientConnInterface,
 		timeout:      timeout,
 		params:       chainParams,
 	}
+}
+
+// RawClientWithMacAuth returns a context with the proper macaroon
+// authentication, the default RPC timeout, and the raw client.
+func (m *walletKitClient) RawClientWithMacAuth(
+	parentCtx context.Context) (context.Context, time.Duration,
+	walletrpc.WalletKitClient) {
+
+	return m.walletKitMac.WithMacaroonAuth(parentCtx), m.timeout, m.client
 }
 
 // ListUnspent returns a list of all utxos spendable by the wallet with a number
@@ -337,8 +353,6 @@ func (m *walletKitClient) ListLeases(ctx context.Context) ([]LeaseDescriptor,
 
 	leases := make([]LeaseDescriptor, 0, len(resp.LockedUtxos))
 	for _, leasedUtxo := range resp.LockedUtxos {
-		leasedUtxo := leasedUtxo
-
 		txHash, err := chainhash.NewHash(
 			leasedUtxo.Outpoint.TxidBytes,
 		)
@@ -529,6 +543,25 @@ func (m *walletKitClient) EstimateFeeRate(ctx context.Context, confTarget int32)
 	return chainfee.SatPerKWeight(resp.SatPerKw), nil
 }
 
+// MinRelayFee returns the current minimum relay fee based on our chain backend
+// in sat/kw.
+func (m *walletKitClient) MinRelayFee(
+	ctx context.Context) (chainfee.SatPerKWeight, error) {
+
+	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+
+	rpcCtx = m.walletKitMac.WithMacaroonAuth(rpcCtx)
+	resp, err := m.client.EstimateFee(rpcCtx, &walletrpc.EstimateFeeRequest{
+		ConfTarget: 6,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return chainfee.SatPerKWeight(resp.MinRelayFeeSatPerKw), nil
+}
+
 // ListSweeps returns a list of sweep transaction ids known to our node.
 // Note that this function only looks up transaction ids (Verbose=false), and
 // does not query our wallet for the full set of transactions.
@@ -703,28 +736,70 @@ func (m *walletKitClient) ListSweepsVerbose(ctx context.Context,
 	return result, nil
 }
 
+// BumpFeeOption customizes a BumpFee call.
+type BumpFeeOption func(*walletrpc.BumpFeeRequest)
+
+// WithImmediate is an option for enabling the immediate mode of BumpFee. The
+// sweeper will sweep this input without waiting for the next block.
+func WithImmediate() BumpFeeOption {
+	return func(r *walletrpc.BumpFeeRequest) {
+		r.Immediate = true
+	}
+}
+
+// WithTargetConf is an option for setting the target_conf of BumpFee. If set,
+// the underlying fee estimator will use the target_conf to estimate the
+// starting fee rate for the fee function. Pass feeRate=0 to BumpFee if you
+// add this option.
+func WithTargetConf(targetConf uint32) BumpFeeOption {
+	return func(r *walletrpc.BumpFeeRequest) {
+		r.TargetConf = targetConf
+	}
+}
+
+// WithBudget is an option for setting the budget of BumpFee. It is the max
+// amount in sats that can be used as the fees. Setting this value greater than
+// the input's value may result in CPFP - one or more wallet utxos will be used
+// to pay the fees specified by the budget. If not set, for new inputs, by
+// default 50% of the input's value will be treated as the budget for fee
+// bumping; for existing inputs, their current budgets will be retained.
+func WithBudget(budget btcutil.Amount) BumpFeeOption {
+	return func(r *walletrpc.BumpFeeRequest) {
+		r.Budget = uint64(budget)
+	}
+}
+
 // BumpFee attempts to bump the fee of a transaction by spending one of its
 // outputs at the given fee rate. This essentially results in a
 // child-pays-for-parent (CPFP) scenario. If the given output has been used in a
 // previous BumpFee call, then a transaction replacing the previous is
 // broadcast, resulting in a replace-by-fee (RBF) scenario.
 func (m *walletKitClient) BumpFee(ctx context.Context, op wire.OutPoint,
-	feeRate chainfee.SatPerKWeight) error {
+	feeRate chainfee.SatPerKWeight, opts ...BumpFeeOption) error {
 
 	rpcCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
-	_, err := m.client.BumpFee(
-		m.walletKitMac.WithMacaroonAuth(rpcCtx),
-		&walletrpc.BumpFeeRequest{
-			Outpoint: &lnrpc.OutPoint{
-				TxidBytes:   op.Hash[:],
-				OutputIndex: op.Index,
-			},
-			SatPerByte: uint32(feeRate.FeePerKVByte() / 1000),
-			Force:      false,
+	req := &walletrpc.BumpFeeRequest{
+		Outpoint: &lnrpc.OutPoint{
+			TxidBytes:   op.Hash[:],
+			OutputIndex: op.Index,
 		},
-	)
+		SatPerVbyte: uint64(feeRate.FeePerVByte()),
+		Immediate:   false,
+	}
+
+	for _, opt := range opts {
+		opt(req)
+	}
+
+	// Make sure that feeRate and WithTargetConf are not used together.
+	if feeRate != 0 && req.TargetConf != 0 {
+		return fmt.Errorf("can't use target_conf if feeRate != 0")
+	}
+
+	_, err := m.client.BumpFee(m.walletKitMac.WithMacaroonAuth(rpcCtx), req)
+
 	return err
 }
 
