@@ -2945,6 +2945,8 @@ type PaymentRequest struct {
 	// PaymentAddress is the payment address associated with the invoice,
 	// set if the receiver supports mpp.
 	PaymentAddress [32]byte
+
+	RouteHints [][]zpay32.HopHint
 }
 
 // DecodePaymentRequest decodes a payment request.
@@ -2978,6 +2980,7 @@ func (s *lightningClient) DecodePaymentRequest(ctx context.Context,
 		Hash:        hash,
 		Value:       lnwire.MilliSatoshi(resp.NumMsat),
 		Description: resp.Description,
+		RouteHints:  unmarshallRouteHints(resp.RouteHints),
 	}
 
 	copy(paymentReq.PaymentAddress[:], resp.PaymentAddr)

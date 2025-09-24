@@ -3,12 +3,14 @@ package lndclient
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -703,6 +705,40 @@ func marshallHopHint(hint zpay32.HopHint) (*lnrpc.HopHint, error) {
 		FeeProportionalMillionths: hint.FeeProportionalMillionths,
 		NodeId:                    nodeID.String(),
 	}, nil
+}
+
+// unmarshallRouteHints unmarshalls a list of route hints.
+func unmarshallRouteHints(rpcRouteHints []*lnrpc.RouteHint) [][]zpay32.HopHint {
+	routeHints := make([][]zpay32.HopHint, 0, len(rpcRouteHints))
+	for _, rrh := range rpcRouteHints {
+		hopHints := make(
+			[]zpay32.HopHint, 0, len(rrh.HopHints),
+		)
+		for _, rh := range rrh.HopHints {
+			hint := unmarshallHopHint(rh)
+			hopHints = append(hopHints, hint)
+		}
+		routeHints = append(routeHints, hopHints)
+	}
+
+	return routeHints
+}
+
+// unmarshallHopHint marshalls a single hop hint.
+func unmarshallHopHint(hint *lnrpc.HopHint) zpay32.HopHint {
+	b, _ := hex.DecodeString(hint.NodeId)
+	nodeId, err := btcec.ParsePubKey(b)
+	if err != nil {
+		panic(err)
+	}
+
+	return zpay32.HopHint{
+		ChannelID:                 hint.ChanId,
+		CLTVExpiryDelta:           uint16(hint.CltvExpiryDelta),
+		FeeBaseMSat:               hint.FeeBaseMsat,
+		FeeProportionalMillionths: hint.FeeProportionalMillionths,
+		NodeID:                    nodeId,
+	}
 }
 
 // SubscribeHtlcEvents subscribes to a stream of htlc events from the router.
